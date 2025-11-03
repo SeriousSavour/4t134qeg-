@@ -2,12 +2,14 @@
   "name": "cloud-browser-engine",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^126.0.0",
     "express": "^4.19.2",
-    "playwright": "^1.45.0",
+    "puppeteer-core": "^22.15.0",
     "ws": "^8.18.0"
   }
 }

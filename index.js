@@ -1,22 +1,20 @@
-// index.js
+// index.js — Playwright + WebSocket cloud browser (same-origin UI)
 const express = require("express");
 const { WebSocketServer } = require("ws");
-const puppeteer = require("puppeteer-core");
-const chromium = require("@sparticuz/chromium");
+const { chromium } = require("playwright");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Serve your UI (put files in /public)
+// Serve UI from /public
 app.use(express.static("public"));
 
 // Health + debug
-app.get("/", (_req, res) => res.status(200).sendFile(__dirname + "/public/index.html"));
+app.get("/", (_req, res) => res.sendFile(__dirname + "/public/index.html"));
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 app.get("/version", async (_req, res) => {
   try {
-    const path = await chromium.executablePath();
-    res.json({ executablePath: path, node: process.version });
+    res.json({ executablePath: "playwright:chromium", node: process.version });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -31,33 +29,17 @@ server.on("upgrade", (req) => console.log("🔁 HTTP upgrade:", req.url));
 // WebSocket on explicit path
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// Lazy browser launcher
-let _browser = null;
+// Lazy browser launcher (single shared browser)
+let browserPromise = null;
 async function getBrowser() {
-  if (_browser && _browser.isConnected()) return _browser;
-
-  const execPath = process.env.CHROME_PATH || (await chromium.executablePath());
-  console.log("🔎 Launching Chromium at:", execPath);
-
-  const args = [
-    ...chromium.args,
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-zygote",
-    "--single-process",
-  ];
-
-  _browser = await puppeteer.launch({
-    executablePath: execPath,
-    headless: chromium.headless,
-    args,
-    defaultViewport: chromium.defaultViewport,
-  });
-
-  console.log("🧊 Browser launched");
-  return _browser;
+  if (!browserPromise) {
+    console.log("🔎 Launching Playwright Chromium...");
+    browserPromise = chromium.launch({
+      headless: true,
+      args: ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+    });
+  }
+  return browserPromise;
 }
 
 wss.on("connection", async (ws, req) => {
@@ -71,9 +53,9 @@ wss.on("connection", async (ws, req) => {
   let context, page;
   try {
     const browser = await getBrowser();
-    context = await browser.createIncognitoBrowserContext();
+    context = await browser.newContext();
     page = await context.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
+    await page.setViewportSize({ width: 1280, height: 720 });
   } catch (e) {
     console.error("❌ Could not open context/page:", e);
     try { ws.close(1011, "browser_launch_failed"); } catch {}
@@ -87,7 +69,7 @@ wss.on("connection", async (ws, req) => {
     try {
       if (type === "navigate" && data?.url) {
         console.log("🌐 navigate:", data.url);
-        await page.goto(data.url, { waitUntil: "networkidle0", timeout: 45000 });
+        await page.goto(data.url, { waitUntil: "networkidle", timeout: 45000 });
       } else if (type === "click" && data) {
         await page.mouse.click(data.x, data.y);
       } else if (type === "scroll" && data) {
@@ -102,7 +84,7 @@ wss.on("connection", async (ws, req) => {
     }
   });
 
-  // stream frames → data URL (common client expectation)
+  // stream frames → data URL
   let on = true;
   (async function loop() {
     while (on && ws.readyState === ws.OPEN) {
@@ -113,7 +95,7 @@ wss.on("connection", async (ws, req) => {
       } catch (e) {
         console.error("frame error:", e.message);
       }
-      await new Promise(r => setTimeout(r, 300)); // ~3fps
+      await new Promise(r => setTimeout(r, 300));
     }
   })();
 
@@ -134,6 +116,6 @@ setInterval(() => {
   });
 }, 30000);
 
-// don’t crash on unhandled errors
+// keep process alive on errors
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));

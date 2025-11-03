@@ -44,7 +44,6 @@
         ws.send(JSON.stringify({ type: "navigate", data: { url: u } }));
       };
 
-      // basic click passthrough (no scaling math yet)
       document.getElementById('view').addEventListener('click', (e) => {
         const rect = e.target.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -52,12 +51,10 @@
         ws.send(JSON.stringify({ type: "click", data: { x, y } }));
       });
 
-      // wheel scroll
       window.addEventListener('wheel', (e) => {
         ws.send(JSON.stringify({ type: "scroll", data: { x: 0, y: window.scrollY + e.deltaY } }));
       });
 
-      // typing (simple)
       window.addEventListener('keydown', (e) => {
         if (e.key.length === 1) ws.send(JSON.stringify({ type: "keypress", data: { text: e.key } }));
         if (e.key === 'Enter') ws.send(JSON.stringify({ type: "keypress", data: { text: "\n" } }));

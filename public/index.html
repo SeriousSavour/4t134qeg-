@@ -15,6 +15,7 @@
     <div id="bar">
       <input id="url" placeholder="https://example.com" style="flex:1"/>
       <button id="go">Go</button>
+      <a href="/snap?url=https://example.com" target="_blank" style="color:#fff;">/snap test</a>
     </div>
     <img id="view"/>
 
@@ -24,9 +25,11 @@
       );
 
       ws.onopen = () => {
+        console.log("WS OPEN");
         const u = new URLSearchParams(location.search).get('url') || "https://example.com";
         document.getElementById('url').value = u;
-        ws.send(JSON.stringify({ type: "navigate", data: { url: u } }));
+        try { ws.send(JSON.stringify({ type: "navigate", data: { url: u } })); }
+        catch (e) { console.error("send on open failed", e); }
         setInterval(() => { if (ws.readyState === 1) ws.send('{"type":"ping"}'); }, 25000);
       };
 
@@ -36,28 +39,35 @@
           if (msg.type === "frame" && msg.data) {
             document.getElementById("view").src = msg.data;
           }
-        } catch {}
+        } catch (e) {
+          console.error("parse error", e);
+        }
+      };
+
+      ws.onclose = (ev) => {
+        console.error("WS CLOSE", ev.code, ev.reason);
       };
 
       document.getElementById('go').onclick = () => {
         const u = document.getElementById('url').value.trim();
-        ws.send(JSON.stringify({ type: "navigate", data: { url: u } }));
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "navigate", data: { url: u } }));
+        else console.error("WS not open");
       };
 
       document.getElementById('view').addEventListener('click', (e) => {
         const rect = e.target.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
-        ws.send(JSON.stringify({ type: "click", data: { x, y } }));
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "click", data: { x, y } }));
       });
 
       window.addEventListener('wheel', (e) => {
-        ws.send(JSON.stringify({ type: "scroll", data: { x: 0, y: window.scrollY + e.deltaY } }));
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "scroll", data: { x: 0, y: window.scrollY + e.deltaY } }));
       });
 
       window.addEventListener('keydown', (e) => {
-        if (e.key.length === 1) ws.send(JSON.stringify({ type: "keypress", data: { text: e.key } }));
-        if (e.key === 'Enter') ws.send(JSON.stringify({ type: "keypress", data: { text: "\n" } }));
+        if (e.key.length === 1 && ws.readyState === 1) ws.send(JSON.stringify({ type: "keypress", data: { text: e.key } }));
+        if (e.key === 'Enter' && ws.readyState === 1) ws.send(JSON.stringify({ type: "keypress", data: { text: "\n" } }));
       });
     </script>
   </body>

@@ -1,4 +1,4 @@
-// index.js — Playwright + WebSocket cloud browser (same-origin UI)
+// index.js — Playwright + WS cloud browser (same-origin UI + diagnostics)
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const { chromium } = require("playwright");
@@ -10,17 +10,32 @@ const PORT = process.env.PORT || 3000;
 app.use(express.static("public"));
 
 // Health + debug
-app.get("/", (_req, res) => res.sendFile(__dirname + "/public/index.html"));
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-app.get("/version", async (_req, res) => {
+app.get("/version", (_req, res) => res.json({ engine: "playwright:chromium", node: process.version }));
+
+// QUICK DIAG: take a screenshot without WS
+app.get("/snap", async (req, res) => {
+  const url = req.query.url || "https://example.com";
   try {
-    res.json({ executablePath: "playwright:chromium", node: process.version });
+    const browser = await getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
+    const buf = await page.screenshot({ type: "jpeg", quality: 70 });
+    await context.close();
+    res.set("Content-Type", "image/jpeg");
+    res.send(buf);
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    console.error("SNAP ERROR:", e);
+    res.status(500).send("snap failed: " + e.message);
   }
 });
 
-// Start HTTP server (needed for WS)
+// Default route shows the UI
+app.get("/", (_req, res) => res.sendFile(__dirname + "/public/index.html"));
+
+// Start HTTP (needed for WS)
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Listening on ${PORT}`);
 });
@@ -29,7 +44,7 @@ server.on("upgrade", (req) => console.log("🔁 HTTP upgrade:", req.url));
 // WebSocket on explicit path
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// Lazy browser launcher (single shared browser)
+// Launch one shared browser lazily (Playwright image contains Chromium)
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
@@ -99,11 +114,11 @@ wss.on("connection", async (ws, req) => {
     }
   })();
 
-  ws.on("close", async () => {
+  ws.on("close", async (code, reason) => {
     on = false;
     try { await page.close(); } catch {}
     try { await context.close(); } catch {}
-    console.log("🔴 WS disconnected");
+    console.log("🔴 WS disconnected", code, reason?.toString());
   });
 });
 
@@ -116,6 +131,6 @@ setInterval(() => {
   });
 }, 30000);
 
-// keep process alive on errors
+// don’t crash on unhandled errors
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));

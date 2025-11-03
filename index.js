@@ -1,3 +1,85 @@
+// index.js — Playwright + WS cloud browser (stable launcher + diagnostics)
+const express = require("express");
+const { WebSocketServer } = require("ws");
+const { chromium } = require("playwright");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Serve static UI
+app.use(express.static("public"));
+
+// Health / debug
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+app.get("/version", (_req, res) =>
+  res.json({ engine: "playwright", node: process.version })
+);
+
+// Snapshot (no WS) — sanity check
+app.get("/snap", async (req, res) => {
+  const url = req.query.url || "https://example.com";
+  try {
+    const browser = await getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 45000 });
+    const buf = await page.screenshot({ type: "jpeg", quality: 70 });
+    await context.close();
+    res.set("Content-Type", "image/jpeg");
+    res.send(buf);
+  } catch (e) {
+    console.error("SNAP ERROR:", e);
+    res.status(500).send("snap failed: " + e.message);
+  }
+});
+
+// Default UI
+app.get("/", (_req, res) => res.sendFile(__dirname + "/public/index.html"));
+
+// Start HTTP
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Listening on ${PORT}`);
+});
+server.on("upgrade", (req) => console.log("🔁 HTTP upgrade:", req.url));
+
+// WebSocket
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+// --- Stable browser launcher with fallback ---
+let browserPromise = null;
+async function launchBrowserStable() {
+  // Try Chrome channel (if present in image), then fallback to bundled Chromium
+  const launchArgs = [
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--use-gl=swiftshader",
+    "--disable-gpu",
+  ];
+
+  // 1) Try chrome channel
+  try {
+    console.log("🔎 Trying launch: channel=chrome …");
+    const b = await chromium.launch({ channel: "chrome", headless: true, args: launchArgs });
+    console.log("✅ Launched with channel=chrome");
+    return b;
+  } catch (e) {
+    console.warn("⚠️ Chrome channel failed, falling back to bundled Chromium:", e.message);
+  }
+
+  // 2) Fallback to default Chromium
+  console.log("🔎 Trying launch: bundled Chromium …");
+  const b = await chromium.launch({ headless: true, args: launchArgs });
+  console.log("✅ Launched bundled Chromium");
+  return b;
+}
+
+async function getBrowser() {
+  if (!browserPromise) browserPromise = launchBrowserStable();
+  return browserPromise;
+}
+// --------------------------------------------
+
 wss.on("connection", async (ws, req) => {
   console.log("🟢 WS connected:", req.url);
 
@@ -9,7 +91,7 @@ wss.on("connection", async (ws, req) => {
   try {
     const browser = await getBrowser();
 
-    // Realistic desktop fingerprint
+    // Realistic context; guard every option
     const viewport = { width: 1366, height: 768 };
     context = await browser.newContext({
       viewport,
@@ -19,39 +101,38 @@ wss.on("connection", async (ws, req) => {
       timezoneId: "America/Los_Angeles",
       colorScheme: "dark",
       deviceScaleFactor: 1,
-      permissions: [], // add origins if you need geolocation/camera later
-      extraHTTPHeaders: {
-        "Accept-Language": "en-US,en;q=0.9"
-      }
+      extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" },
     });
 
     page = await context.newPage();
+    await page.setViewportSize(viewport);
 
-    // Pretend to be non-automation
+    // addInitScript must never throw — wrap in try
     await page.addInitScript(() => {
-      // hide webdriver
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-      // common WebGL vendor spoof
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function (p) {
-        if (p === 37445) return "Intel Inc.";          // UNMASKED_VENDOR_WEBGL
-        if (p === 37446) return "Intel(R) UHD Graphics"; // UNMASKED_RENDERER_WEBGL
-        return getParameter.call(this, p);
-      };
+      try {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+        if (window.WebGLRenderingContext) {
+          const getParameter = WebGLRenderingContext.prototype.getParameter;
+          WebGLRenderingContext.prototype.getParameter = function (p) {
+            if (p === 37445) return "Intel Inc.";
+            if (p === 37446) return "Intel(R) UHD Graphics";
+            return getParameter.call(this, p);
+          };
+        }
+      } catch (e) {
+        // ignore
+      }
     });
 
-    // Useful diagnostics
-    page.on("console", msg => console.log("📜 console:", msg.type(), msg.text()));
-    page.on("pageerror", err => console.error("💥 pageerror:", err));
-    page.on("requestfailed", req => console.error("⛔ requestfailed:", req.url(), req.failure()?.errorText));
-    page.on("response", resp => {
+    // Diagnostics — these never throw
+    page.on("console", (msg) => console.log("📜 console:", msg.type(), msg.text()));
+    page.on("pageerror", (err) => console.error("💥 pageerror:", err));
+    page.on("requestfailed", (req) =>
+      console.error("⛔ requestfailed:", req.url(), req.failure()?.errorText)
+    );
+    page.on("response", (resp) => {
       if (resp.status() >= 400) console.error("⚠️ response", resp.status(), resp.url());
     });
-
-    // Launch-time tuning (already in your getBrowser, but ensure args include these)
-    // In getBrowser(): args: ["--disable-dev-shm-usage","--no-sandbox","--use-gl=swiftshader","--disable-gpu"]
-
-    await page.setViewportSize(viewport);
   } catch (e) {
     console.error("❌ Could not open context/page:", e);
     try { ws.close(1011, "browser_launch_failed"); } catch {}
@@ -64,10 +145,7 @@ wss.on("connection", async (ws, req) => {
     try {
       if (type === "navigate" && data?.url) {
         console.log("🌐 navigate:", data.url);
-        await page.goto(data.url, {
-          waitUntil: "networkidle",
-          timeout: 60000
-        });
+        await page.goto(data.url, { waitUntil: "networkidle", timeout: 60000 });
       } else if (type === "click" && data) {
         await page.mouse.click(data.x, data.y);
       } else if (type === "scroll" && data) {
@@ -79,23 +157,21 @@ wss.on("connection", async (ws, req) => {
       }
     } catch (e) {
       console.error("WS msg error:", e);
-      // also tell the client so it can show a toast
       try { ws.send(JSON.stringify({ type: "error", message: String(e) })); } catch {}
     }
   });
 
-  // stream frames → data URL
+  // stream frames
   let on = true;
   (async function loop() {
     while (on && ws.readyState === ws.OPEN) {
       try {
         const img = await page.screenshot({ type: "jpeg", quality: 70 });
-        const dataUrl = "data:image/jpeg;base64," + img.toString("base64");
-        ws.send(JSON.stringify({ type: "frame", data: dataUrl }));
+        ws.send(JSON.stringify({ type: "frame", data: "data:image/jpeg;base64," + img.toString("base64") }));
       } catch (e) {
         console.error("frame error:", e.message);
       }
-      await new Promise(r => setTimeout(r, 250)); // a bit smoother
+      await new Promise((r) => setTimeout(r, 250));
     }
   })();
 
@@ -106,3 +182,16 @@ wss.on("connection", async (ws, req) => {
     console.log("🔴 WS disconnected", code, reason?.toString());
   });
 });
+
+// WS keepalive sweep
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 30000);
+
+// Never crash the process
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));

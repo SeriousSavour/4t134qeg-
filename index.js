@@ -1,95 +1,51 @@
-// index.js
-const express = require("express");
-const { WebSocketServer } = require("ws");
-const puppeteer = require("puppeteer-core");
-const chromium = require("@sparticuz/chromium");
+wss.on("connection", async (ws, req) => {
+  console.log("🟢 WS connected:", req.url);
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+  // keepalive
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
 
-app.get("/", (_req, res) => res.status(200).send("✅ Engine up. Connect via WebSocket."));
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-app.get("/version", async (_req, res) => {
-  try {
-    const path = await chromium.executablePath();
-    res.json({ executablePath: path, node: process.version });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Listening on ${PORT}`);
-});
-
-const wss = new WebSocketServer({ server });
-
-let _browser = null;
-async function getBrowser() {
-  if (_browser && _browser.isConnected()) return _browser;
-
-  const execPath = process.env.CHROME_PATH || (await chromium.executablePath());
-  console.log("🔎 Launching Chromium at:", execPath);
-
-  // Some platforms need these extra flags to avoid crashes
-  const args = [
-    ...chromium.args,
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-zygote",
-    "--single-process",
-  ];
-
-  _browser = await puppeteer.launch({
-    executablePath: execPath,
-    headless: chromium.headless,        // use library’s recommended setting
-    args,
-    defaultViewport: chromium.defaultViewport,
-  });
-
-  console.log("🧊 Browser launched");
-  return _browser;
-}
-
-wss.on("connection", async (ws) => {
-  console.log("🟢 WS client connected");
   let context, page;
   try {
     const browser = await getBrowser();
     context = await browser.createIncognitoBrowserContext();
     page = await context.newPage();
+    await page.setViewport({ width: 1280, height: 720 });
   } catch (e) {
     console.error("❌ Could not open context/page:", e);
-    ws.close();
+    try { ws.close(1011, "browser_launch_failed"); } catch {}
     return;
   }
 
   ws.on("message", async (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    const { type, data } = msg || {};
     try {
-      const { type, data } = JSON.parse(buf.toString());
-      if (type === "navigate") {
+      if (type === "navigate" && data?.url) {
         console.log("🌐 navigate:", data.url);
         await page.goto(data.url, { waitUntil: "networkidle0", timeout: 45000 });
-      } else if (type === "click") {
+      } else if (type === "click" && data) {
         await page.mouse.click(data.x, data.y);
-      } else if (type === "scroll") {
+      } else if (type === "scroll" && data) {
         await page.evaluate(({ x, y }) => window.scrollTo(x, y), { x: data.x, y: data.y });
-      } else if (type === "keypress") {
+      } else if (type === "keypress" && data?.text) {
         await page.keyboard.type(data.text);
+      } else if (type === "ping") {
+        ws.send(JSON.stringify({ type: "pong" }));
       }
     } catch (e) {
       console.error("WS msg error:", e);
     }
   });
 
-  let streaming = true;
+  let on = true;
   (async function loop() {
-    while (streaming && ws.readyState === ws.OPEN) {
+    while (on && ws.readyState === ws.OPEN) {
       try {
         const img = await page.screenshot({ type: "jpeg", quality: 70 });
-        ws.send(JSON.stringify({ type: "frame", base64: img.toString("base64") }));
+        const dataUrl = "data:image/jpeg;base64," + img.toString("base64");
+        ws.send(JSON.stringify({ type: "frame", data: dataUrl }));
       } catch (e) {
         console.error("frame error:", e.message);
       }
@@ -98,13 +54,9 @@ wss.on("connection", async (ws) => {
   })();
 
   ws.on("close", async () => {
-    streaming = false;
+    on = false;
     try { await page.close(); } catch {}
     try { await context.close(); } catch {}
-    console.log("🔴 WS client disconnected");
+    console.log("🔴 WS disconnected");
   });
 });
-
-// Log unhandled errors instead of hard-crashing
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
